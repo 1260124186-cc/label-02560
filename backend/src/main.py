@@ -7,7 +7,7 @@ import click
 
 from .font_extractor import FontExtractor, extract_and_replace
 from .config import DEFAULT_GLYPH_NAMES
-from .exceptions import FontExtractorError
+from .exceptions import FontExtractorError, MissingGlyphError
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,7 +25,15 @@ def cli():
 @click.option("-t", "--target", required=True, type=click.Path(exists=True), help="目标字体文件路径")
 @click.option("-o", "--output", required=True, type=click.Path(), help="输出字体文件路径")
 @click.option("-g", "--glyphs", default=None, help="要提取的字符名称，逗号分隔（默认使用预设列表）")
-def extract(source: str, target: str, output: str, glyphs: Optional[str]):
+@click.option(
+    "-m", "--mode", "missing_glyph_mode",
+    type=click.Choice(["strict", "append"], case_sensitive=False),
+    default="strict",
+    help="缺字处理模式：strict=缺字即失败（默认），append=在目标中新增字形槽位"
+)
+@click.option("--no-cmap", is_flag=True, default=False, help="append 模式下不将 Unicode 映射写入目标 cmap 表")
+def extract(source: str, target: str, output: str, glyphs: Optional[str],
+            missing_glyph_mode: str, no_cmap: bool):
     """从源字体提取字符并替换到目标字体"""
     glyph_names = None
     if glyphs:
@@ -36,6 +44,7 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str]):
         click.echo(f"Target: {target}")
         click.echo(f"Output: {output}")
         click.echo(f"Glyphs: {len(glyph_names) if glyph_names else len(DEFAULT_GLYPH_NAMES)}")
+        click.echo(f"Mode: {missing_glyph_mode}")
         click.echo("-" * 50)
 
         progress_bars = {}
@@ -53,7 +62,9 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str]):
             output_path, report = extract_and_replace(
                 source_font_path=source, target_font_path=target,
                 output_path=output, glyph_names=glyph_names,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                missing_glyph_mode=missing_glyph_mode,
+                write_cmap=not no_cmap
             )
         finally:
             for bar in progress_bars.values():
@@ -64,6 +75,13 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str]):
         click.echo(f"  Variable font: src={report['source_is_variable']}, tgt={report['target_is_variable']}")
         click.echo(f"  Glyphs: {report['extracted_glyphs_count']}")
 
+    except MissingGlyphError as e:
+        logger.error(f"Missing glyphs in target: {e.missing_glyphs}")
+        click.echo(f"✗ Missing glyphs in target font ({len(e.missing_glyphs)}):", err=True)
+        for name in e.missing_glyphs:
+            click.echo(f"  - {name}", err=True)
+        click.echo("  Hint: use --mode append to add missing glyphs automatically", err=True)
+        sys.exit(1)
     except FontExtractorError as e:
         logger.error(f"Extraction failed: {e}")
         click.echo(f"✗ Error: {e}", err=True)

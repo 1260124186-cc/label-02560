@@ -29,3 +29,16 @@ class ValidationError(FontExtractorError):
 class VariableFontError(FontExtractorError):
     """可变字体处理异常"""
     pass
+
+
+class MissingGlyphError(FontExtractorError):
+    """目标字体缺字异常，携带缺字清单"""
+
+    def __init__(self, message: str, missing_glyphs: list = None):
+        super().__init__(message)
+        self.missing_glyphs = missing_glyphs or []
+
+
+class GlyphComponentError(FontExtractorError):
+    """复合字形组件引用异常，组件指向的字形在目标中不存在"""
+    pass
