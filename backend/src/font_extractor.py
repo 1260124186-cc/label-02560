@@ -9,8 +9,9 @@ from fontTools.ttLib.tables._g_l_y_f import Glyph as TTGlyph
 from .config import DEFAULT_GLYPH_NAMES, GLYPH_NAME_TO_UNICODE, NON_STANDARD_GLYPH_NAMES
 from .exceptions import (
     FontLoadError, GlyphNotFoundError, FontSaveError, VariableFontError,
-    MissingGlyphError, GlyphComponentError
+    MissingGlyphError, GlyphComponentError, GlyphNameConflictError
 )
+from .glyph_alias import GlyphAliasResolver
 from .validator import (
     validate_font_file, validate_glyphs_exist, validate_output_path, is_variable_font
 )
@@ -28,6 +29,8 @@ class FontExtractor:
         self.source_path: Optional[Path] = None
         self.target_path: Optional[Path] = None
         self.extracted_glyphs: Dict[str, Any] = {}
+        self.alias_resolver: Optional[GlyphAliasResolver] = None
+        self._name_mapping: Dict[str, str] = {}
 
     def load_source_font(self, font_path: str) -> "FontExtractor":
         """
@@ -58,6 +61,71 @@ class FontExtractor:
         self.target_font = validate_font_file(font_path)
         self.target_path = Path(font_path)
         return self
+
+    def set_alias_resolver(self, resolver: GlyphAliasResolver) -> "FontExtractor":
+        """
+        设置字形名别名解析器
+
+        Args:
+            resolver: GlyphAliasResolver 实例
+
+        Returns:
+            self，支持链式调用
+        """
+        self.alias_resolver = resolver
+        return self
+
+    def resolve_glyph_names_for_extract(
+        self,
+        glyph_names: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        """在 extract 前统一解析字形名
+
+        流程：
+        1. 若有 alias_resolver，执行名称解析（映射表 + Unicode 码位映射 + 冲突处理）
+        2. 返回 (源字体中要提取的字形名列表, 跳过的字形名列表)
+        3. 同时构建 _name_mapping 记录源名→目标名的映射，供 replace 时使用
+
+        Args:
+            glyph_names: 原始字形名列表
+
+        Returns:
+            (解析后用于提取的源字形名列表, 跳过的字形名列表)
+        """
+        if self.source_font is None or self.target_font is None:
+            raise FontLoadError("Source and target fonts must be loaded before resolving names")
+
+        if self.alias_resolver is None:
+            return glyph_names, []
+
+        resolved, skipped, conflict_report = self.alias_resolver.resolve_glyph_names(
+            self.source_font, self.target_font, glyph_names
+        )
+
+        source_glyph_order = set(self.source_font.getGlyphOrder())
+        target_glyph_order = set(self.target_font.getGlyphOrder())
+
+        source_names_for_extract = []
+        self._name_mapping = {}
+
+        for orig, resolved_name in zip(glyph_names, resolved):
+            if orig in skipped:
+                continue
+            if resolved_name in source_glyph_order:
+                source_names_for_extract.append(resolved_name)
+            elif orig in source_glyph_order:
+                source_names_for_extract.append(orig)
+                if orig != resolved_name:
+                    self._name_mapping[orig] = resolved_name
+            else:
+                logger.warning(f"Glyph '{orig}' (resolved: '{resolved_name}') not found in source font, skipping")
+                skipped.append(orig)
+
+        logger.info(
+            f"Name resolution: {len(source_names_for_extract)} to extract, "
+            f"{len(self._name_mapping)} name mappings, {len(skipped)} skipped"
+        )
+        return source_names_for_extract, skipped
 
     def extract_glyphs(
         self,
@@ -387,6 +455,9 @@ class FontExtractor:
         """
         将提取的字符替换到目标字体
 
+        若存在 _name_mapping（别名解析产生的源名→目标名映射），
+        则在替换时将源名下的字形数据写入目标名对应的槽位。
+
         Args:
             glyphs_data: 要替换的字符数据，默认使用已提取的数据
             progress_callback: 进度回调，接收 (current, total, glyph_name) 参数
@@ -416,8 +487,20 @@ class FontExtractor:
         logger.info(f"Replacing {len(glyphs_data)} glyphs in target font (mode={missing_glyph_mode})")
 
         target_glyph_order = set(self.target_font.getGlyphOrder())
+
+        remapped_data: Dict[str, Any] = {}
+        reverse_mapping = {v: k for k, v in self._name_mapping.items()}
+
+        for src_name, data in glyphs_data.items():
+            if src_name in self._name_mapping:
+                tgt_name = self._name_mapping[src_name]
+                remapped_data[tgt_name] = data
+                logger.debug(f"Name mapping during replace: source '{src_name}' -> target '{tgt_name}'")
+            else:
+                remapped_data[src_name] = data
+
         missing_in_target = [
-            name for name in glyphs_data if name not in target_glyph_order
+            name for name in remapped_data if name not in target_glyph_order
         ]
 
         if missing_glyph_mode == "strict" and missing_in_target:
@@ -428,12 +511,12 @@ class FontExtractor:
             )
 
         if missing_glyph_mode == "append" and missing_in_target:
-            self._ensure_composite_deps_in_source(missing_in_target, glyphs_data)
+            self._ensure_composite_deps_in_source(missing_in_target, remapped_data)
 
         replaced_count = 0
         appended_count = 0
-        total = len(glyphs_data)
-        for i, (glyph_name, glyph_data) in enumerate(glyphs_data.items()):
+        total = len(remapped_data)
+        for i, (glyph_name, glyph_data) in enumerate(remapped_data.items()):
             if glyph_name in target_glyph_order:
                 if self._replace_single_glyph(glyph_name, glyph_data):
                     replaced_count += 1
@@ -772,7 +855,9 @@ def extract_and_replace(
     glyph_names: Optional[List[str]] = None,
     progress_callback: Optional[Any] = None,
     missing_glyph_mode: str = "strict",
-    write_cmap: bool = True
+    write_cmap: bool = True,
+    mapping_path: Optional[str] = None,
+    conflict_strategy: str = "abort",
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     一键提取和替换字符的便捷函数
@@ -786,6 +871,8 @@ def extract_and_replace(
             phase: "extract" 或 "replace"
         missing_glyph_mode: 缺字处理模式，"strict" 或 "append"
         write_cmap: append 模式下是否将 Unicode 映射写入目标 cmap 表
+        mapping_path: 源名→目标名映射文件路径（JSON），可选
+        conflict_strategy: 冲突策略，"abort"/"skip"/"first"
 
     Returns:
         (输出文件路径, 提取报告)
@@ -803,7 +890,21 @@ def extract_and_replace(
     try:
         extractor.load_source_font(source_font_path)
         extractor.load_target_font(target_font_path)
-        extractor.extract_glyphs(glyph_names, progress_callback=_extract_cb)
+
+        if mapping_path:
+            resolver = GlyphAliasResolver(conflict_strategy=conflict_strategy)
+            resolver.load_mapping(mapping_path)
+            extractor.set_alias_resolver(resolver)
+
+            if glyph_names is None:
+                glyph_names = list(DEFAULT_GLYPH_NAMES)
+            resolved_names, skipped = extractor.resolve_glyph_names_for_extract(glyph_names)
+            if skipped:
+                logger.warning(f"Skipped {len(skipped)} glyphs due to conflicts: {skipped}")
+            extractor.extract_glyphs(resolved_names, progress_callback=_extract_cb)
+        else:
+            extractor.extract_glyphs(glyph_names, progress_callback=_extract_cb)
+
         extractor.replace_glyphs(
             progress_callback=_replace_cb,
             missing_glyph_mode=missing_glyph_mode,

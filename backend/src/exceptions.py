@@ -1,4 +1,5 @@
 """自定义异常模块"""
+from typing import Any
 
 
 class FontExtractorError(Exception):
@@ -42,3 +43,11 @@ class MissingGlyphError(FontExtractorError):
 class GlyphComponentError(FontExtractorError):
     """复合字形组件引用异常，组件指向的字形在目标中不存在"""
     pass
+
+
+class GlyphNameConflictError(FontExtractorError):
+    """字形名冲突异常：一名多码或一码多名"""
+
+    def __init__(self, message: str, conflict_report: Any = None):
+        super().__init__(message)
+        self.conflict_report = conflict_report

@@ -7,7 +7,8 @@ import click
 
 from .font_extractor import FontExtractor, extract_and_replace
 from .config import DEFAULT_GLYPH_NAMES
-from .exceptions import FontExtractorError, MissingGlyphError
+from .exceptions import FontExtractorError, MissingGlyphError, GlyphNameConflictError
+from .glyph_alias import GlyphAliasResolver
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,8 +33,21 @@ def cli():
     help="缺字处理模式：strict=缺字即失败（默认），append=在目标中新增字形槽位"
 )
 @click.option("--no-cmap", is_flag=True, default=False, help="append 模式下不将 Unicode 映射写入目标 cmap 表")
+@click.option(
+    "--mapping", "mapping_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="源名→目标名映射文件路径（JSON 格式）"
+)
+@click.option(
+    "--conflict", "conflict_strategy",
+    type=click.Choice(["abort", "skip", "first"], case_sensitive=False),
+    default="abort",
+    help="冲突策略：abort=检测到冲突即中止（默认），skip=跳过冲突字形，first=取首个匹配"
+)
 def extract(source: str, target: str, output: str, glyphs: Optional[str],
-            missing_glyph_mode: str, no_cmap: bool):
+            missing_glyph_mode: str, no_cmap: bool,
+            mapping_path: Optional[str], conflict_strategy: str):
     """从源字体提取字符并替换到目标字体"""
     glyph_names = None
     if glyphs:
@@ -45,6 +59,9 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str],
         click.echo(f"Output: {output}")
         click.echo(f"Glyphs: {len(glyph_names) if glyph_names else len(DEFAULT_GLYPH_NAMES)}")
         click.echo(f"Mode: {missing_glyph_mode}")
+        if mapping_path:
+            click.echo(f"Mapping: {mapping_path}")
+            click.echo(f"Conflict: {conflict_strategy}")
         click.echo("-" * 50)
 
         progress_bars = {}
@@ -64,7 +81,9 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str],
                 output_path=output, glyph_names=glyph_names,
                 progress_callback=progress_callback,
                 missing_glyph_mode=missing_glyph_mode,
-                write_cmap=not no_cmap
+                write_cmap=not no_cmap,
+                mapping_path=mapping_path,
+                conflict_strategy=conflict_strategy,
             )
         finally:
             for bar in progress_bars.values():
@@ -81,6 +100,14 @@ def extract(source: str, target: str, output: str, glyphs: Optional[str],
         for name in e.missing_glyphs:
             click.echo(f"  - {name}", err=True)
         click.echo("  Hint: use --mode append to add missing glyphs automatically", err=True)
+        sys.exit(1)
+    except GlyphNameConflictError as e:
+        logger.error(f"Glyph name conflict: {e}")
+        click.echo(f"✗ Glyph name conflict detected: {e}", err=True)
+        if e.conflict_report:
+            resolver = GlyphAliasResolver()
+            click.echo(resolver.format_conflict_report(e.conflict_report), err=True)
+        click.echo("  Hint: use --conflict skip to skip conflicted glyphs, or --conflict first to use first match", err=True)
         sys.exit(1)
     except FontExtractorError as e:
         logger.error(f"Extraction failed: {e}")
@@ -382,6 +409,63 @@ def _run_diff(font_a_path: str, font_b_path: str):
 
     fa.close()
     fb.close()
+
+
+@cli.command("cmap-report")
+@click.argument("source_font", type=click.Path(exists=True))
+@click.argument("target_font", type=click.Path(exists=True))
+@click.option("-g", "--glyphs", default=None, help="要检查的字形名称，逗号分隔（默认检查非标准名 glyph22~glyph31）")
+@click.option("--json", "output_json", is_flag=True, default=False, help="以 JSON 格式输出报告")
+@click.option(
+    "--conflict", "conflict_strategy",
+    type=click.Choice(["abort", "skip", "first"], case_sensitive=False),
+    default="abort",
+    help="冲突策略：abort=检测到冲突即告警（默认），skip=跳过，first=取首个匹配"
+)
+def cmap_report(source_font: str, target_font: str, glyphs: Optional[str],
+                output_json: bool, conflict_strategy: str):
+    """生成非标准字形名的源/目标 cmap 对照报告
+
+    对 glyph22~glyph31 等非标准名：扫描源/目标全部 cmap 子表，
+    生成对照报告（码位、平台 ID、子表索引），供人工确认是否同一字符。
+    同时检测冲突（一名多码、一码多名）。
+    """
+    import json as json_mod
+    from fontTools.ttLib import TTFont
+    from .config import NON_STANDARD_GLYPH_NAMES
+
+    try:
+        src = TTFont(source_font)
+        tgt = TTFont(target_font)
+
+        glyph_names = [g.strip() for g in glyphs.split(",")] if glyphs else list(NON_STANDARD_GLYPH_NAMES)
+
+        resolver = GlyphAliasResolver(conflict_strategy=conflict_strategy)
+
+        comparison_report = resolver.generate_cmap_report(src, tgt, glyph_names)
+        conflict_report = resolver.detect_conflicts(tgt, glyph_names)
+
+        if output_json:
+            result = {
+                "source_font": source_font,
+                "target_font": target_font,
+                "glyph_names": glyph_names,
+                "comparison": comparison_report.to_dict(),
+                "conflicts": conflict_report.to_dict(),
+            }
+            click.echo(json_mod.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            click.echo(resolver.format_cmap_report(comparison_report))
+            if conflict_report.has_conflicts:
+                click.echo("")
+                click.echo(resolver.format_conflict_report(conflict_report))
+
+        src.close()
+        tgt.close()
+
+    except Exception as e:
+        click.echo(f"✗ Error: {e}", err=True)
+        sys.exit(1)
 
 
 @cli.command()
