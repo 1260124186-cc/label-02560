@@ -1,0 +1,15 @@
+services:
+  font-extractor:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: font-extractor:latest
+    container_name: font-extractor
+    volumes:
+      - ./fonts:/data/fonts
+      - ./output:/data/output
+      - ./logs:/app/logs
+    working_dir: /app
+    command: ["demo"]
+    stdin_open: true
+    tty: true

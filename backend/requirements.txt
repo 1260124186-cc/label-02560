@@ -1,0 +1,3 @@
+fonttools==4.47.0
+click==8.1.7
+loguru==0.7.2
